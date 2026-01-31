@@ -52,8 +52,7 @@ def call_openai_json(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Calls the Responses API and expects a JSON object back.
-    Returns (parsed_json, meta).
-    meta includes elapsed, usage (if available), raw_text.
+    Returns (parsed_json, meta). Meta is kept for debugging but never printed.
     """
     last_error = None
 
@@ -109,19 +108,40 @@ class SufficiencyReport(BaseModel):
     key_dimensions: List[str] = Field(default_factory=list)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
+SpecialistName = Literal[
+    "numbers",
+    "entities",
+    "time_qualifiers",
+    "relevance",
+    "causality",
+    "definitions",
+]
+
 class SpecialistReport(BaseModel):
-    specialist: Literal["numbers", "entities", "time_qualifiers"]
+    specialist: SpecialistName
     passed: bool
     reasoning: str
     issues: List[str] = Field(default_factory=list)
     confidence: float = Field(..., ge=0.0, le=1.0)
 
 class ArbiterReport(BaseModel):
-    final_verdict: FinalVerdict
+    final_verdict: Literal["FAITHFUL", "MUTATED"]
     summary_reason: str
     decisive_points: List[str] = Field(default_factory=list)
     required_extra_info: List[str] = Field(default_factory=list)
     confidence: float = Field(..., ge=0.0, le=1.0)
+
+class ArbiterAuditReport(BaseModel):
+    approved: bool
+    audit_reason: str
+    detected_flaws: List[str] = Field(default_factory=list)
+    revised_final_verdict: Optional[FinalVerdict] = None
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+class FinalSummary(BaseModel):
+    verdict: FinalVerdict
+    reason: str
+    key_points: List[str] = Field(default_factory=list)
 
 class CommitteeResult(BaseModel):
     row_index: int
@@ -129,8 +149,15 @@ class CommitteeResult(BaseModel):
     system_claim: str
 
     sufficiency: SufficiencyReport
-    specialists: List[SpecialistReport]
-    arbiter: ArbiterReport
+    specialists: List[SpecialistReport] = Field(default_factory=list)
+
+    arbiter_1: Optional[ArbiterReport] = None
+    arbiter_2: Optional[ArbiterAuditReport] = None
+
+    final_verdict: FinalVerdict
+    final_reason: str
+
+    final_summary: Optional[FinalSummary] = None
 
     meta: Dict[str, Any] = Field(default_factory=dict)
 
@@ -142,30 +169,28 @@ class CommitteeResult(BaseModel):
 def agent_context_sufficiency(reference_truth: str, system_claim: str) -> Tuple[SufficiencyReport, Dict[str, Any]]:
     system = (
         "You are a strict context sufficiency judge for semantic faithfulness.\n"
-        "You DO NOT have web access.\n"
-        "Task: decide whether the provided REFERENCE TRUTH contains enough information to judge whether\n"
-        "the SYSTEM CLAIM faithfully preserves its meaning.\n"
+        "Decide whether REFERENCE TRUTH contains enough information to judge whether SYSTEM CLAIM\n"
+        "faithfully preserves the meaning.\n"
         "Be strict about: entity identity, timeframe, scope, qualifiers, definitions, missing numbers/units.\n"
-        "If insufficient, set sufficient=false and list the minimum extra info needed to decide.\n"
+        "If insufficient, set sufficient=false and list the minimum extra info needed.\n"
         "Return ONLY valid JSON."
     )
 
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
+    user = (
+        "REFERENCE TRUTH:\n"
+        f"{reference_truth}\n\n"
+        "SYSTEM CLAIM:\n"
+        f"{system_claim}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "sufficient": true,\n'
+        '  "reasoning": "string",\n'
+        '  "needed_info": ["..."],\n'
+        '  "key_dimensions": ["..."],\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
 
-SYSTEM CLAIM:
-{system_claim}
-
-Return JSON:
-{{
-  "sufficient": true,
-  "reasoning": "string",
-  "needed_info": ["..."],
-  "key_dimensions": ["..."],
-  "confidence": 0.0
-}}
-"""
     parsed, meta = call_openai_json(system, user)
     try:
         return SufficiencyReport(**parsed), meta
@@ -173,174 +198,105 @@ Return JSON:
         raise RuntimeError(f"Invalid SufficiencyReport output: {parsed}") from e
 
 
-def agent_specialist_numbers(reference_truth: str, system_claim: str) -> Tuple[SpecialistReport, Dict[str, Any]]:
-    system = (
-        "You are a specialist checker for NUMBERS, UNITS, quantities, magnitudes, and arithmetic consistency.\n"
-        "You DO NOT have web access.\n"
-        "Compare SYSTEM CLAIM against REFERENCE TRUTH for:\n"
-        "- number changes (including ranges, approximations, rounding)\n"
-        "- unit changes (%, £, km, years, etc.)\n"
-        "- added/removed numeric qualifiers (at least, exactly, about)\n"
-        "- arithmetic contradictions\n"
-        "If there is any material mismatch, passed=false and list issues.\n"
-        "Return ONLY valid JSON."
-    )
-
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
-
-SYSTEM CLAIM:
-{system_claim}
-
-Return JSON:
-{{
-  "specialist": "numbers",
-  "passed": true,
-  "reasoning": "string",
-  "issues": ["..."],
-  "confidence": 0.0
-}}
-"""
-    parsed, meta = call_openai_json(system, user)
-    try:
-        return SpecialistReport(**parsed), meta
-    except ValidationError as e:
-        raise RuntimeError(f"Invalid SpecialistReport(numbers) output: {parsed}") from e
-
-
-def agent_specialist_entities(reference_truth: str, system_claim: str) -> Tuple[SpecialistReport, Dict[str, Any]]:
-    system = (
-        "You are a specialist checker for ENTITIES: names of people, places, organisations, products, and identifiers.\n"
-        "You DO NOT have web access.\n"
-        "Compare SYSTEM CLAIM against REFERENCE TRUTH for:\n"
-        "- entity substitution (different person/place/org)\n"
-        "- missing/added entities\n"
-        "- ambiguous pronoun resolution causing drift\n"
-        "- changed relationships (who did what to whom)\n"
-        "If any material mismatch or unsupported addition, passed=false and list issues.\n"
-        "Return ONLY valid JSON."
-    )
-
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
-
-SYSTEM CLAIM:
-{system_claim}
-
-Return JSON:
-{{
-  "specialist": "entities",
-  "passed": true,
-  "reasoning": "string",
-  "issues": ["..."],
-  "confidence": 0.0
-}}
-"""
-    parsed, meta = call_openai_json(system, user)
-    try:
-        return SpecialistReport(**parsed), meta
-    except ValidationError as e:
-        raise RuntimeError(f"Invalid SpecialistReport(entities) output: {parsed}") from e
-
-
-def agent_specialist_time_qualifiers(reference_truth: str, system_claim: str) -> Tuple[SpecialistReport, Dict[str, Any]]:
-    system = (
-        "You are a specialist checker for TIMEFRAMES, QUALIFIERS, modality, and scope.\n"
-        "You DO NOT have web access.\n"
-        "Compare SYSTEM CLAIM against REFERENCE TRUTH for:\n"
-        "- timeframe drift (was vs is, dates, 'recently', 'in 2020', etc.)\n"
-        "- qualifier drift (may/must, likely/definitely, some/most/all)\n"
-        "- scope drift (subset vs superset, conditions removed)\n"
-        "- causality claims added (X caused Y) when not present\n"
-        "If any material mismatch or unsupported strengthening/weakening, passed=false and list issues.\n"
-        "Return ONLY valid JSON."
-    )
-
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
-
-SYSTEM CLAIM:
-{system_claim}
-
-Return JSON:
-{{
-  "specialist": "time_qualifiers",
-  "passed": true,
-  "reasoning": "string",
-  "issues": ["..."],
- F"  "confidence": 0.0
-}}
-"""
-    # NOTE: There is a stray 'F"' risk in some editors; keep this string literal exact.
-    # We'll build it safely to avoid accidental corruption.
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
-
-SYSTEM CLAIM:
-{system_claim}
-
-Return JSON:
-{{
-  "specialist": "time_qualifiers",
-  "passed": true,
-  "reasoning": "string",
-  "issues": ["..."],
-  "confidence": 0.0
-}}
-"""
-    parsed, meta = call_openai_json(system, user)
-    try:
-        return SpecialistReport(**parsed), meta
-    except ValidationError as e:
-        raise RuntimeError(f"Invalid SpecialistReport(time_qualifiers) output: {parsed}") from e
-
-
-def agent_arbiter(
+def _agent_specialist_generic(
+    specialist: SpecialistName,
+    system_prompt: str,
     reference_truth: str,
     system_claim: str,
-    sufficiency: SufficiencyReport,
+) -> Tuple[SpecialistReport, Dict[str, Any]]:
+    system = system_prompt + "\nReturn ONLY valid JSON."
+
+    user = (
+        "REFERENCE TRUTH:\n"
+        f"{reference_truth}\n\n"
+        "SYSTEM CLAIM:\n"
+        f"{system_claim}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        f'  "specialist": "{specialist}",\n'
+        '  "passed": true,\n'
+        '  "reasoning": "string",\n'
+        '  "issues": ["..."],\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
+
+    parsed, meta = call_openai_json(system, user)
+    try:
+        return SpecialistReport(**parsed), meta
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid SpecialistReport({specialist}) output: {parsed}") from e
+
+
+SPECIALIST_PROMPTS: Dict[SpecialistName, str] = {
+    "relevance": (
+        "You are a specialist checker for RELEVANCE / TOPIC ALIGNMENT.\n"
+        "Decide whether the SYSTEM CLAIM is about the same core subject as the REFERENCE TRUTH.\n"
+        "Fail if there is topic drift, non-sequitur, or cherry-picking that changes the main point.\n"
+        "If material irrelevance exists, passed=false and list issues."
+    ),
+    "numbers": (
+        "You are a specialist checker for NUMBERS, UNITS, quantities, magnitudes, and arithmetic consistency.\n"
+        "Compare SYSTEM CLAIM against REFERENCE TRUTH for number/range/rounding/unit changes and contradictions.\n"
+        "If any material mismatch, passed=false and list issues."
+    ),
+    "entities": (
+        "You are a specialist checker for ENTITIES: people, places, organisations, products, identifiers.\n"
+        "Compare SYSTEM CLAIM against REFERENCE TRUTH for entity substitution, missing/added entities,\n"
+        "relationship changes (who did what to whom), or ambiguity that changes meaning.\n"
+        "If any material mismatch or unsupported addition, passed=false and list issues."
+    ),
+    "time_qualifiers": (
+        "You are a specialist checker for TIMEFRAMES, QUALIFIERS, modality, and scope.\n"
+        "Compare SYSTEM CLAIM against REFERENCE TRUTH for timeframe drift, qualifier drift (may/must etc.),\n"
+        "and scope drift (subset/superset, conditions removed).\n"
+        "If any material mismatch or unsupported strengthening/weakening, passed=false and list issues."
+    ),
+    "causality": (
+        "You are a specialist checker for CAUSALITY and INFERENCE.\n"
+        "Compare SYSTEM CLAIM against REFERENCE TRUTH for added/removed causal links (caused/led to/due to),\n"
+        "or correlation upgraded to causation, or mechanisms asserted without support.\n"
+        "If any unsupported causality is introduced (or removed when essential), passed=false and list issues."
+    ),
+    "definitions": (
+        "You are a specialist checker for DEFINITIONS and TERM SUBSTITUTION.\n"
+        "Compare SYSTEM CLAIM against REFERENCE TRUTH for term replacements that change meaning,\n"
+        "definition drift, category/type errors, and technical/legal loosening or strengthening.\n"
+        "If any material definition/term drift is present, passed=false and list issues."
+    ),
+}
+
+
+def agent_arbiter_1(
+    reference_truth: str,
+    system_claim: str,
     specialists: List[SpecialistReport],
 ) -> Tuple[ArbiterReport, Dict[str, Any]]:
     system = (
-        "You are an arbiter that outputs the final verdict on semantic faithfulness.\n"
-        "You DO NOT have web access.\n"
+        "You are Arbiter #1 producing a final verdict on semantic faithfulness.\n"
         "Rules:\n"
-        "- If sufficiency.sufficient is false, final_verdict MUST be AMBIGUOUS.\n"
-        "- If sufficiency is true, but ANY specialist passed=false, final_verdict MUST be MUTATED.\n"
-        "- If sufficiency is true and ALL specialists passed=true, final_verdict MUST be FAITHFUL.\n"
+        "- If ANY specialist passed=false, final_verdict MUST be MUTATED.\n"
+        "- If ALL specialists passed=true, final_verdict MUST be FAITHFUL.\n"
         "Return ONLY valid JSON."
     )
 
-    user = f"""
-REFERENCE TRUTH:
-{reference_truth}
+    user = (
+        "REFERENCE TRUTH:\n"
+        f"{reference_truth}\n\n"
+        "SYSTEM CLAIM:\n"
+        f"{system_claim}\n\n"
+        "SPECIALISTS:\n"
+        f"{[s.model_dump() for s in specialists]}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "final_verdict": "FAITHFUL|MUTATED",\n'
+        '  "summary_reason": "string",\n'
+        '  "decisive_points": ["..."],\n'
+        '  "required_extra_info": [],\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
 
-SYSTEM CLAIM:
-{system_claim}
-
-SUFFICIENCY:
-sufficient: {sufficiency.sufficient}
-reasoning: {sufficiency.reasoning}
-needed_info: {sufficiency.needed_info}
-key_dimensions: {sufficiency.key_dimensions}
-confidence: {sufficiency.confidence}
-
-SPECIALISTS:
-{[s.model_dump() for s in specialists]}
-
-Return JSON:
-{{
-  "final_verdict": "FAITHFUL|MUTATED|AMBIGUOUS",
-  "summary_reason": "string",
-  "decisive_points": ["..."],
-  "required_extra_info": ["..."],
-  "confidence": 0.0
-}}
-"""
     parsed, meta = call_openai_json(system, user)
     try:
         return ArbiterReport(**parsed), meta
@@ -348,99 +304,241 @@ Return JSON:
         raise RuntimeError(f"Invalid ArbiterReport output: {parsed}") from e
 
 
+def agent_arbiter_2_audit(
+    reference_truth: str,
+    system_claim: str,
+    specialists: List[SpecialistReport],
+    arbiter_1: ArbiterReport,
+) -> Tuple[ArbiterAuditReport, Dict[str, Any]]:
+    system = (
+        "You are Arbiter #2 auditing Arbiter #1 for logical soundness.\n"
+        "Your job:\n"
+        "- Check Arbiter #1 verdict matches specialist results (rule-following).\n"
+        "- Check Arbiter #1 reasoning aligns with specialist issues and does not invent facts.\n"
+        "Output:\n"
+        "- approved=true if Arbiter #1 reasoning is sound.\n"
+        "- approved=false if reasoning is debatable/unsound; then revised_final_verdict MUST be AMBIGUOUS.\n"
+        "Return ONLY valid JSON."
+    )
+
+    user = (
+        "REFERENCE TRUTH:\n"
+        f"{reference_truth}\n\n"
+        "SYSTEM CLAIM:\n"
+        f"{system_claim}\n\n"
+        "SPECIALISTS:\n"
+        f"{[s.model_dump() for s in specialists]}\n\n"
+        "ARBITER_1_OUTPUT:\n"
+        f"{arbiter_1.model_dump()}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "approved": true,\n'
+        '  "audit_reason": "string",\n'
+        '  "detected_flaws": ["..."],\n'
+        '  "revised_final_verdict": null,\n'
+        '  "confidence": 0.0\n'
+        "}\n"
+    )
+
+    parsed, meta = call_openai_json(system, user)
+    try:
+        return ArbiterAuditReport(**parsed), meta
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid ArbiterAuditReport output: {parsed}") from e
+
+
+def agent_final_summariser(res: CommitteeResult) -> Tuple[FinalSummary, Dict[str, Any]]:
+    system = (
+        "You are a concise summariser.\n"
+        "Given the structured jury outcome, produce a very short verdict + reason.\n"
+        "Do not add new facts. Keep reason one sentence. Provide up to 3 key points.\n"
+        "Return ONLY valid JSON."
+    )
+
+    user = (
+        "INPUT_RESULT_JSON:\n"
+        f"{res.model_dump()}\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "verdict": "FAITHFUL|MUTATED|AMBIGUOUS",\n'
+        '  "reason": "string",\n'
+        '  "key_points": ["..."]\n'
+        "}\n"
+    )
+
+    parsed, meta = call_openai_json(system, user)
+    try:
+        return FinalSummary(**parsed), meta
+    except ValidationError as e:
+        raise RuntimeError(f"Invalid FinalSummary output: {parsed}") from e
+
+
 # =====================================================
 # Orchestrator
 # =====================================================
 
+DEFAULT_SPECIALISTS: List[SpecialistName] = [
+    "relevance",
+    "numbers",
+    "entities",
+    "time_qualifiers",
+    "causality",
+    "definitions",
+]
+
+
 def run_committee(reference_truth: str, system_claim: str, row_index: int) -> CommitteeResult:
     meta: Dict[str, Any] = {}
 
-    suff, m1 = agent_context_sufficiency(reference_truth, system_claim)
-    meta["sufficiency"] = m1
+    # Step 1) Context sufficiency gate
+    suff, m_suff = agent_context_sufficiency(reference_truth, system_claim)
+    meta["sufficiency"] = m_suff
 
+    if not suff.sufficient:
+        final_verdict: FinalVerdict = "AMBIGUOUS"
+        needed = ", ".join(suff.needed_info) if suff.needed_info else "more supporting detail"
+        final_reason = f"Insufficient context to judge faithfulness. Needed: {needed}"
+
+        res = CommitteeResult(
+            row_index=row_index,
+            reference_truth=reference_truth,
+            system_claim=system_claim,
+            sufficiency=suff,
+            specialists=[],
+            arbiter_1=None,
+            arbiter_2=None,
+            final_verdict=final_verdict,
+            final_reason=final_reason,
+            meta=meta,
+        )
+
+        summary, m_sum = agent_final_summariser(res)
+        res.final_summary = summary
+        meta["final_summary"] = m_sum
+        return res
+
+    # Step 2) Specialists
     specialists: List[SpecialistReport] = []
-    if suff.sufficient:
-        nrep, mn = agent_specialist_numbers(reference_truth, system_claim)
-        erep, me = agent_specialist_entities(reference_truth, system_claim)
-        trep, mt = agent_specialist_time_qualifiers(reference_truth, system_claim)
-        specialists = [nrep, erep, trep]
-        meta["numbers"] = mn
-        meta["entities"] = me
-        meta["time_qualifiers"] = mt
+    for name in DEFAULT_SPECIALISTS:
+        rep, m = _agent_specialist_generic(name, SPECIALIST_PROMPTS[name], reference_truth, system_claim)
+        specialists.append(rep)
+        meta[f"spec_{name}"] = m
 
-    arb, ma = agent_arbiter(reference_truth, system_claim, suff, specialists)
-    meta["arbiter"] = ma
+    # Step 3) Arbiter #1
+    arb1, m_a1 = agent_arbiter_1(reference_truth, system_claim, specialists)
+    meta["arbiter_1"] = m_a1
 
-    return CommitteeResult(
+    # Step 4) Arbiter #2 audit
+    arb2, m_a2 = agent_arbiter_2_audit(reference_truth, system_claim, specialists, arb1)
+    meta["arbiter_2"] = m_a2
+
+    # Step 5) Final verdict
+    if not arb2.approved:
+        final_verdict = "AMBIGUOUS"
+        final_reason = f"Debatable: Arbiter #2 did not approve Arbiter #1 reasoning. {arb2.audit_reason}"
+    else:
+        final_verdict = arb1.final_verdict
+        final_reason = arb1.summary_reason
+
+    res = CommitteeResult(
         row_index=row_index,
         reference_truth=reference_truth,
         system_claim=system_claim,
         sufficiency=suff,
         specialists=specialists,
-        arbiter=arb,
+        arbiter_1=arb1,
+        arbiter_2=arb2,
+        final_verdict=final_verdict,
+        final_reason=final_reason,
         meta=meta,
     )
 
+    # Step 6) Final summariser
+    summary, m_sum = agent_final_summariser(res)
+    res.final_summary = summary
+    meta["final_summary"] = m_sum
+
+    return res
+
 
 # =====================================================
-# Pretty Output
+# Output Helpers (human, step-by-step; no perf/diagnostics)
 # =====================================================
 
 def _clip(s: str, n: int = 900) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[: n - 3] + "..."
 
-def _fmt_tokens(meta: Dict[str, Any]) -> str:
-    u = meta.get("usage", {}) if meta else {}
-    it = u.get("input_tokens")
-    ot = u.get("output_tokens")
-    if it is None or ot is None:
-        return ""
-    return f" (toks {it}/{ot})"
 
 def print_result(res: CommitteeResult) -> None:
     print("\n" + "=" * 80)
-    print(f"ROW {res.row_index} — FINAL: {res.arbiter.final_verdict} (conf={res.arbiter.confidence:.2f})")
+    print(f"ROW {res.row_index}")
     print("=" * 80)
 
-    print("\nREFERENCE TRUTH:")
-    print(_clip(res.reference_truth))
-    print("\nSYSTEM CLAIM:")
-    print(_clip(res.system_claim))
+    print("\nStep 0 — Inputs")
+    print(f"- Reference truth: {_clip(res.reference_truth, 350)}")
+    print(f"- System claim:    {_clip(res.system_claim, 350)}")
 
-    print("\n--- CONTEXT SUFFICIENCY ---")
-    print(f"sufficient={res.sufficiency.sufficient} (conf={res.sufficiency.confidence:.2f})")
-    print(_clip(res.sufficiency.reasoning, 700))
+    print("\nStep 1 — Context sufficiency")
+    print(f"- Sufficient: {res.sufficiency.sufficient}")
+    print(f"- Reasoning:  {_clip(res.sufficiency.reasoning, 700)}")
     if res.sufficiency.key_dimensions:
-        print("key_dimensions:")
-        for d in res.sufficiency.key_dimensions[:10]:
-            print(f"- {d}")
-    if not res.sufficiency.sufficient and res.sufficiency.needed_info:
-        print("needed_info:")
-        for x in res.sufficiency.needed_info[:12]:
-            print(f"- {x}")
+        print(f"- Key checks: {', '.join(res.sufficiency.key_dimensions[:8])}")
+    print(f"- Confidence: {res.sufficiency.confidence:.2f}")
 
-    if res.specialists:
-        print("\n--- SPECIALISTS ---")
-        for s in res.specialists:
-            status = "PASS" if s.passed else "FAIL"
-            print(f"[{s.specialist}] {status} (conf={s.confidence:.2f})")
-            print(f"  {_clip(s.reasoning, 450)}")
-            for iss in s.issues[:6]:
-                print(f"  - issue: {_clip(iss, 240)}")
+    if not res.sufficiency.sufficient:
+        if res.sufficiency.needed_info:
+            print("\nStep 1b — Needed info to decide")
+            for x in res.sufficiency.needed_info[:12]:
+                print(f"- {_clip(x, 260)}")
 
-    print("\n--- ARBITER ---")
-    print(_clip(res.arbiter.summary_reason, 700))
-    for p in res.arbiter.decisive_points[:10]:
-        print(f"- {_clip(p, 260)}")
-    if res.arbiter.final_verdict == "AMBIGUOUS" and res.arbiter.required_extra_info:
-        print("required_extra_info:")
-        for x in res.arbiter.required_extra_info[:12]:
-            print(f"- {_clip(x, 240)}")
+        print("\nStep 2 — Final decision")
+        print(f"- VERDICT: {res.final_verdict}")
+        print(f"- REASON:  {_clip(res.final_reason, 420)}")
 
-    print("\n--- PERF ---")
-    for k, m in res.meta.items():
-        print(f"{k:18s}: {m.get('elapsed', 0.0):.2f}s{_fmt_tokens(m)}")
+        if res.final_summary:
+            print("\nStep 3 — Concise summary")
+            print(f"- Verdict: {res.final_summary.verdict}")
+            print(f"- Reason:  {_clip(res.final_summary.reason, 240)}")
+            for kp in res.final_summary.key_points[:3]:
+                print(f"  • {_clip(kp, 240)}")
+        return
+
+    print("\nStep 2 — Specialist checks")
+    for s in res.specialists:
+        status = "PASS" if s.passed else "FAIL"
+        print(f"- [{s.specialist}] {status} (conf={s.confidence:.2f})")
+        print(f"  Reasoning: {_clip(s.reasoning, 450)}")
+        for iss in s.issues[:4]:
+            print(f"  • {_clip(iss, 260)}")
+
+    print("\nStep 3 — Arbiter #1")
+    if res.arbiter_1:
+        print(f"- Verdict:   {res.arbiter_1.final_verdict}")
+        print(f"- Reason:    {_clip(res.arbiter_1.summary_reason, 450)}")
+        for p in res.arbiter_1.decisive_points[:5]:
+            print(f"  • {_clip(p, 260)}")
+        print(f"- Confidence: {res.arbiter_1.confidence:.2f}")
+
+    print("\nStep 4 — Arbiter #2 audit")
+    if res.arbiter_2:
+        print(f"- Approved:  {res.arbiter_2.approved}")
+        print(f"- Reason:    {_clip(res.arbiter_2.audit_reason, 450)}")
+        if res.arbiter_2.detected_flaws:
+            for f in res.arbiter_2.detected_flaws[:5]:
+                print(f"  • {_clip(f, 260)}")
+        print(f"- Confidence: {res.arbiter_2.confidence:.2f}")
+
+    print("\nStep 5 — Final decision (end)")
+    print(f"- VERDICT: {res.final_verdict}")
+    print(f"- REASON:  {_clip(res.final_reason, 420)}")
+
+    if res.final_summary:
+        print("\nStep 6 — Concise summary")
+        print(f"- Verdict: {res.final_summary.verdict}")
+        print(f"- Reason:  {_clip(res.final_summary.reason, 240)}")
+        for kp in res.final_summary.key_points[:3]:
+            print(f"  • {_clip(kp, 240)}")
 
 
 # =====================================================
@@ -453,12 +551,12 @@ def main():
     TRUTH_COL = "truth"
     CLAIM_COL = "claim"
 
-    rows_to_check = [5, 6]  # only two rows as requested
-    SWAP_FACT_AND_CLAIM = False
+    rows_to_check = [5, 6]  # only these rows
+    SWAP_FACT_AND_CLAIM = False  # set True if your CSV columns are reversed
 
     rows = df.iloc[[i for i in rows_to_check if i in df.index]]
 
-    print("\nFACTTRACE — NO-WEB CONTEXT SUFFICIENCY + SPECIALIST JURY (2 rows)")
+    print("\nFACTTRACE — SUFFICIENCY-GATED SPECIALIST JURY + DOUBLE ARBITER + FINAL SUMMARY")
     print(f"Model: {MODEL}")
     print("-" * 72)
 
