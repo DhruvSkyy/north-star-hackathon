@@ -3,26 +3,28 @@ import json
 import time
 import pandas as pd
 from typing import List
-from pydantic import BaseModel, Field
-from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
+from openai import OpenAI, APIError
 
 # =========================
 # Environment & OpenAI
 # =========================
 
 load_dotenv(override=True)
-api_key = os.getenv("OPENAI_API_KEY")  # put it in .env, do NOT hard-code it
+
+api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY not set")
 
 client = OpenAI(api_key=api_key)
 
-MODEL = "gpt-5.2"
+MODEL = "gpt-4.1"   # explicit 4.1 usage
+TEMPERATURE = 0.0   # determinism for jury work
+MAX_RETRIES = 3
 
-# Pricing per 1M tokens (input, output)
 PRICING = {
-    "gpt-5.2": (1.75, 14.00),
+    "gpt-4.1": (1.00, 3.00),  # update if needed
 }
 
 # =========================
@@ -31,7 +33,7 @@ PRICING = {
 
 class AgentVerdict(BaseModel):
     agent_name: str
-    verdict: str = Field(..., description="faithful or mutated")
+    verdict: str = Field(..., pattern="^(faithful|mutated)$")
     reasoning: str
     confidence: float = Field(..., ge=0.0, le=1.0)
 
@@ -41,32 +43,45 @@ class JuryResult(BaseModel):
     agent_votes: List[AgentVerdict]
 
 # =========================
-# OpenAI Call Helper
+# OpenAI Call Helper (4.1)
 # =========================
 
-def call_openai(prompt: str) -> dict:
-    start = time.perf_counter()
+def call_openai_json(prompt: str) -> dict:
+    """Robust JSON-only OpenAI call with retries and cost tracking."""
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            start = time.perf_counter()
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
+            response = client.responses.create(
+                model=MODEL,
+                input=prompt,
+                temperature=TEMPERATURE,
+                response_format={"type": "json_object"},
+            )
 
-    elapsed = time.perf_counter() - start
-    usage = response.usage
-    content = response.choices[0].message.content
+            elapsed = time.perf_counter() - start
+            usage = response.usage
+            content = response.output_text
 
-    in_price, out_price = PRICING[MODEL]
-    input_cost = usage.prompt_tokens * in_price / 1_000_000
-    output_cost = usage.completion_tokens * out_price / 1_000_000
-    total_cost = input_cost + output_cost
+            in_price, out_price = PRICING[MODEL]
+            cost = (
+                usage.input_tokens * in_price
+                + usage.output_tokens * out_price
+            ) / 1_000_000
 
-    return {
-        "content": content,
-        "elapsed": elapsed,
-        "usage": usage,
-        "cost": total_cost,
-    }
+            return {
+                "content": content,
+                "elapsed": elapsed,
+                "usage": usage,
+                "cost": cost,
+            }
+
+        except (APIError, json.JSONDecodeError) as e:
+            last_error = e
+            time.sleep(0.5 * attempt)
+
+    raise RuntimeError(f"OpenAI call failed after retries: {last_error}")
 
 # =========================
 # Jury Agent
@@ -79,7 +94,7 @@ class JuryAgent:
 
     def judge(self, reference_truth: str, system_claim: str) -> AgentVerdict:
         prompt = f"""
-You are a member of an AI truth jury.
+You are an AI truth jury member.
 
 AGENT NAME:
 {self.name}
@@ -87,69 +102,87 @@ AGENT NAME:
 ROLE:
 {self.role}
 
-REFERENCE TRUTH (ground truth):
-"{reference_truth}"
+REFERENCE TRUTH:
+{reference_truth}
 
-SYSTEM CLAIM (derived statement):
-"{system_claim}"
+SYSTEM CLAIM:
+{system_claim}
 
-TASK:
-- Decide whether the SYSTEM CLAIM is a FAITHFUL or MUTATED representation of the REFERENCE TRUTH.
-- Focus on meaning, implication, scope, qualifiers, and causal framing.
-- "Technically true" is NOT sufficient if the meaning shifts.
+DECISION RULES:
+- Decide if the claim is FAITHFUL or MUTATED relative to the truth.
+- Semantic drift, exaggeration, missing qualifiers = MUTATED.
+- Literal correctness alone is insufficient.
 
-Return ONLY valid JSON in this exact format:
+Return valid JSON ONLY:
+
 {{
   "verdict": "faithful or mutated",
-  "reasoning": "clear explanation",
+  "reasoning": "concise but precise explanation",
   "confidence": 0.0
 }}
 """
-        result = call_openai(prompt)
-        content = result["content"]
 
-        if "```json" in content:
-            content = content.split("```json", 1)[1].split("```", 1)[0]
+        result = call_openai_json(prompt)
 
-        parsed = json.loads(content)
-
-        return AgentVerdict(
-            agent_name=self.name,
-            verdict=parsed["verdict"].lower(),
-            reasoning=parsed["reasoning"],
-            confidence=float(parsed["confidence"]),
-        )
+        try:
+            parsed = json.loads(result["content"])
+            return AgentVerdict(
+                agent_name=self.name,
+                verdict=parsed["verdict"],
+                reasoning=parsed["reasoning"],
+                confidence=float(parsed["confidence"]),
+            )
+        except (KeyError, ValidationError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"Invalid agent output from {self.name}: {e}")
 
 # =========================
-# Arbiter (Non-LLM)
+# Arbiter (Confidence-Weighted)
 # =========================
 
 def arbitrate(votes: List[AgentVerdict]) -> JuryResult:
-    mutated = [v for v in votes if v.verdict == "mutated"]
-    faithful = [v for v in votes if v.verdict == "faithful"]
+    score = {"faithful": 0.0, "mutated": 0.0}
 
-    if len(mutated) >= 2:
+    for v in votes:
+        score[v.verdict] += v.confidence
+
+    if score["mutated"] >= score["faithful"] + 0.5:
         final = "MUTATED"
-        reason = "Multiple agents identified semantic drift, exaggeration, or misleading framing."
-    elif len(faithful) == len(votes):
+        reason = "Confidence-weighted consensus indicates semantic distortion."
+    elif score["faithful"] >= score["mutated"] + 0.5:
         final = "FAITHFUL"
-        reason = "All agents agree the claim preserves the original meaning."
+        reason = "Confidence-weighted consensus indicates meaning preserved."
     else:
         final = "AMBIGUOUS"
-        reason = "Agents disagreed; the claim is borderline and interpretation-dependent."
+        reason = "Confidence scores are close; interpretation-dependent."
 
-    return JuryResult(final_verdict=final, summary_reason=reason, agent_votes=votes)
+    return JuryResult(
+        final_verdict=final,
+        summary_reason=reason,
+        agent_votes=votes,
+    )
 
 # =========================
-# Run Jury on One Pair
+# Run Jury
 # =========================
 
 def run_jury(reference_truth: str, system_claim: str) -> JuryResult:
     agents = [
-        JuryAgent("Literal Fact Checker", "Be pedantic. Check numbers, qualifiers, scope, and literal accuracy."),
-        JuryAgent("Context & Intent Analyst", "Assess whether the overall meaning or implication has shifted."),
-        JuryAgent("Sceptic", "Assume the claim is misleading. Actively try to prove mutation."),
-        JuryAgent("Common Sense Judge", "Judge whether a reasonable reader would be misled."),
+        JuryAgent(
+            "Literal Fact Checker",
+            "Check numerical accuracy, qualifiers, and explicit scope."
+        ),
+        JuryAgent(
+            "Context & Intent Analyst",
+            "Evaluate implied meaning and framing."
+        ),
+        JuryAgent(
+            "Sceptic",
+            "Assume the claim is misleading unless proven otherwise."
+        ),
+        JuryAgent(
+            "Common Sense Judge",
+            "Assess how a reasonable reader would interpret it."
+        ),
     ]
 
     votes = [agent.judge(reference_truth, system_claim) for agent in agents]
@@ -162,56 +195,44 @@ def run_jury(reference_truth: str, system_claim: str) -> JuryResult:
 def main():
     df = pd.read_csv("North_Star.csv")
 
-    # Columns in your CSV
     TRUTH_COL = "truth"
     CLAIM_COL = "claim"
 
-    # Pick EXACTLY the rows you want (these should be the 5 “interesting” ones)
-    # (Example indices — replace with your chosen five.)
     rows_to_check = [5, 6, 7, 12, 19]
-
-    # If you suspect the dataset columns are reversed, flip this to True.
     SWAP_FACT_AND_CLAIM = False
 
-    # Subset the dataframe to ONLY those rows (and drop any out-of-range)
-    valid_rows = [i for i in rows_to_check if 0 <= i < len(df)]
-    sub = df.iloc[valid_rows].copy()
+    rows = df.iloc[[i for i in rows_to_check if i in df.index]]
 
     print("\n====================================")
-    print(" FACTTRACE – AGENTIC CONSENSUS (GPT-5.2)")
+    print(" FACTTRACE – AGENTIC CONSENSUS (GPT-4.1)")
     print("====================================\n")
 
-    for idx, row in sub.iterrows():
-        truth_text = str(row[TRUTH_COL])
-        claim_text = str(row[CLAIM_COL])
+    for idx, row in rows.iterrows():
+        truth = str(row[TRUTH_COL])
+        claim = str(row[CLAIM_COL])
 
-        # Direction control (fixes your “swapped around” concern)
-        if SWAP_FACT_AND_CLAIM:
-            reference_truth, system_claim = claim_text, truth_text
-        else:
-            reference_truth, system_claim = truth_text, claim_text
+        reference_truth, system_claim = (
+            (claim, truth) if SWAP_FACT_AND_CLAIM else (truth, claim)
+        )
 
-        print("\n------------------------------------")
-        print(f"ROW {idx}")
-        print("------------------------------------")
-        print("\nREFERENCE TRUTH:")
-        print(reference_truth)
-        print("\nSYSTEM CLAIM:")
-        print(system_claim)
+        print(f"\n--- ROW {idx} ---")
+        print("\nREFERENCE TRUTH:\n", reference_truth)
+        print("\nSYSTEM CLAIM:\n", system_claim)
 
         result = run_jury(reference_truth, system_claim)
 
-        print("\n--- AGENT DEBATE ---")
+        print("\n--- AGENT VERDICTS ---")
         for v in result.agent_votes:
-            print(f"\n[{v.agent_name}]")
-            print(f"Verdict   : {v.verdict.upper()}")
-            print(f"Confidence: {v.confidence}")
-            print(f"Reasoning : {v.reasoning}")
+            print(
+                f"\n[{v.agent_name}] "
+                f"{v.verdict.upper()} "
+                f"(conf={v.confidence:.2f})\n"
+                f"{v.reasoning}"
+            )
 
         print("\n=== FINAL VERDICT ===")
         print(result.final_verdict)
         print("WHY:", result.summary_reason)
-        print("\n")
 
 if __name__ == "__main__":
     main()
