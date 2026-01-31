@@ -1,9 +1,10 @@
 """Deterministic arbiter logic."""
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from .schemas import (
     BuiltContext,
+    CriticReport,
     FactCheckReport,
     GapAnalysis,
     IntegrityReport,
@@ -17,6 +18,7 @@ def arbitrate(
     integrity: IntegrityReport,
     context: BuiltContext,
     gap: GapAnalysis,
+    critic: Optional[CriticReport] = None,
 ) -> Tuple[str, str, Dict[str, float]]:
     """
     Deterministic decision logic inspired by the paper’s rule-based arbiter:
@@ -26,6 +28,7 @@ def arbitrate(
     """
 
     score = {"faithful": 0.0, "mutated": 0.0, "ambiguous": 0.0}
+    critic_note = ""
 
     if not relevancy.relevant and relevancy.confidence >= 0.70:
         score["mutated"] += 1.0
@@ -59,6 +62,13 @@ def arbitrate(
     if factcheck.ambiguous_due_to_missing_context:
         score["ambiguous"] += 0.8 * factcheck.confidence
 
+    if critic:
+        if critic.issues:
+            score["ambiguous"] += 0.4 * critic.confidence
+            critic_note = " Critic flagged unresolved issues."
+        if any(req.priority == "high" for req in critic.requests):
+            score["ambiguous"] += 0.2 * critic.confidence
+
     score[factcheck.verdict] += 1.0 * factcheck.confidence
     score["mutated"] += mutated_weight * factcheck.confidence
     score["faithful"] += 0.15 * context.confidence
@@ -76,10 +86,18 @@ def arbitrate(
         )
 
     if top_label == "mutated":
-        return ("MUTATED", "Deterministic arbiter found high-confidence semantic distortion flags.", score)
+        return (
+            "MUTATED",
+            "Deterministic arbiter found high-confidence semantic distortion flags." + critic_note,
+            score,
+        )
     if top_label == "faithful":
-        return ("FAITHFUL", "Deterministic arbiter found meaning preserved with no high-severity drift.", score)
-    return ("AMBIGUOUS", "Arbiter could not reach a stable margin.", score)
+        return (
+            "FAITHFUL",
+            "Deterministic arbiter found meaning preserved with no high-severity drift." + critic_note,
+            score,
+        )
+    return ("AMBIGUOUS", "Arbiter could not reach a stable margin." + critic_note, score)
 
 
 __all__ = ["arbitrate"]

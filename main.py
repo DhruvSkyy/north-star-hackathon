@@ -42,6 +42,14 @@ def main():
             print(f"\n[{agent.agent_name}] (confidence={agent.confidence:.2f})")
             print(json.dumps(agent.output, indent=2, ensure_ascii=False))
 
+        if result.critic:
+            print("\n--- CRITIC ---")
+            print(f"(confidence={result.critic.confidence:.2f})")
+            print(json.dumps(result.critic.model_dump(), indent=2, ensure_ascii=False))
+
+        if result.reruns:
+            print("\nRERUNS TRIGGERED:", result.reruns)
+
         print("\n=== FINAL VERDICT ===")
         print(result.final_verdict)
         print("WHY:", result.summary_reason)

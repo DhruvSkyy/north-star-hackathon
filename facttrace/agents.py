@@ -1,11 +1,12 @@
-"""LLM-backed agents used by the committee."""
+"""LLM-backed agents used by the committee, plus a critic for reruns."""
 
-from typing import List
+from typing import List, Optional
 from pydantic import ValidationError
 
 from .openai_utils import call_openai_json
 from .schemas import (
     BuiltContext,
+    CriticReport,
     FactCheckReport,
     GapAnalysis,
     IntegrityReport,
@@ -23,13 +24,15 @@ class BaseAgent:
 class ContextGapDetectorAgent(BaseAgent):
     name = "ContextGapDetector"
 
-    def run(self, reference_truth: str, system_claim: str) -> GapAnalysis:
+    def run(self, reference_truth: str, system_claim: str, critic_feedback: Optional[str] = None) -> GapAnalysis:
         system = (
             "You are a specialised context gap detector for truthfulness evaluation.\n"
             "Your job: identify what context is REQUIRED to judge whether the claim faithfully preserves the meaning of the reference.\n"
             "You must be strict: if the reference includes qualifiers, scope, timeframe, definitions, or implicit constraints, surface them.\n"
             "Return ONLY valid JSON."
         )
+
+        feedback = critic_feedback or "(none)"
 
         user = f"""
 REFERENCE TRUTH:
@@ -38,16 +41,22 @@ REFERENCE TRUTH:
 SYSTEM CLAIM:
 {system_claim}
 
+CRITIC FEEDBACK (address explicitly):
+{feedback}
+
 TASK:
 1) List the minimum missing-context questions needed to judge faithfulness WITHOUT guessing.
 2) List key dimensions to audit (scope, timeframe, entity identity, units, definitions, qualifiers, causality, normative language, etc.).
 3) Provide a confidence score for your gap analysis.
+4) Provide a brief explanation (one or two sentences) of your reasoning and optionally warnings.
 
 OUTPUT JSON SCHEMA:
 {{
   "missing_context_questions": ["..."],
   "key_dimensions": ["..."],
-  "confidence": 0.0
+  "confidence": 0.0,
+  "explanation": "string",
+  "warnings": ["..."]
 }}
 """
         parsed, _ = call_openai_json(system, user)
@@ -60,22 +69,16 @@ OUTPUT JSON SCHEMA:
 class ContextBuilderAgent(BaseAgent):
     name = "ContextBuilder"
 
-    def run(self, reference_truth: str, gap: GapAnalysis) -> BuiltContext:
+    def run(self, reference_truth: str, gap: GapAnalysis, critic_feedback: Optional[str] = None) -> BuiltContext:
         system = (
             "You are a specialised context builder for semantic faithfulness checking.\n"
             "You MUST build context strictly from the REFERENCE TRUTH provided (no outside facts).\n"
-            "Convert the reference into:\n"
-            "- a neutral distilled summary,\n"
-            "- definitions (if terms are used in a specific way),\n"
-            "- scope rules (what is in/out of scope),\n"
-            "- qualifier rules (must-keep constraints),\n"
-            "- negative examples of common mistakes,\n"
-            "- common fallacies to avoid when comparing claims.\n"
             "Return ONLY valid JSON."
         )
 
         questions = "\n".join(f"- {q}" for q in gap.missing_context_questions) or "- (none)"
         dims = "\n".join(f"- {d}" for d in gap.key_dimensions) or "- (none)"
+        feedback = critic_feedback or "(none)"
 
         user = f"""
 REFERENCE TRUTH:
@@ -86,6 +89,9 @@ GAP QUESTIONS TO ADDRESS:
 
 KEY AUDIT DIMENSIONS:
 {dims}
+
+CRITIC FEEDBACK (address explicitly):
+{feedback}
 
 CONSTRAINTS:
 - Use ONLY information present in the reference truth.
@@ -99,7 +105,9 @@ OUTPUT JSON SCHEMA:
   "qualifier_rules": ["..."],
   "negative_examples": ["..."],
   "common_fallacies_to_avoid": ["..."],
-  "confidence": 0.0
+  "confidence": 0.0,
+  "explanation": "string",
+  "warnings": ["..."]
 }}
 """
         parsed, _ = call_openai_json(system, user)
@@ -112,13 +120,15 @@ OUTPUT JSON SCHEMA:
 class RelevancyAssessorAgent(BaseAgent):
     name = "RelevancyAssessor"
 
-    def run(self, context: BuiltContext, system_claim: str) -> RelevancyReport:
+    def run(self, context: BuiltContext, system_claim: str, critic_feedback: Optional[str] = None) -> RelevancyReport:
         system = (
             "You are a relevancy gate.\n"
             "Decide if the SYSTEM CLAIM is about the same topic/entity/event described by the distilled reference.\n"
             "Be conservative: if it is clearly unrelated, mark relevant=false.\n"
             "Return ONLY valid JSON."
         )
+
+        feedback = critic_feedback or "(none)"
 
         user = f"""
 DISTILLED REFERENCE:
@@ -127,11 +137,16 @@ DISTILLED REFERENCE:
 SYSTEM CLAIM:
 {system_claim}
 
+CRITIC FEEDBACK (address explicitly):
+{feedback}
+
 OUTPUT JSON SCHEMA:
 {{
   "relevant": true,
   "reason": "string",
-  "confidence": 0.0
+  "confidence": 0.0,
+  "explanation": "string",
+  "warnings": ["..."]
 }}
 """
         parsed, _ = call_openai_json(system, user)
@@ -144,7 +159,7 @@ OUTPUT JSON SCHEMA:
 class FactCheckerAgent(BaseAgent):
     name = "FactChecker"
 
-    def run(self, reference_truth: str, system_claim: str, context: BuiltContext) -> FactCheckReport:
+    def run(self, reference_truth: str, system_claim: str, context: BuiltContext, critic_feedback: Optional[str] = None) -> FactCheckReport:
         system = (
             "You are the Fact Checker.\n"
             "Goal: decide whether the SYSTEM CLAIM is faithful to the REFERENCE TRUTH.\n"
@@ -160,6 +175,8 @@ class FactCheckerAgent(BaseAgent):
 
         def _bullets(xs: List[str]) -> str:
             return "\n".join(f"- {x}" for x in xs) if xs else "- (none)"
+
+        feedback = critic_feedback or "(none)"
 
         user = f"""
 REFERENCE TRUTH:
@@ -184,6 +201,9 @@ NEGATIVE EXAMPLES (what to avoid):
 COMMON FALLACIES TO AVOID:
 {_bullets(context.common_fallacies_to_avoid)}
 
+CRITIC FEEDBACK (address explicitly):
+{feedback}
+
 OUTPUT JSON SCHEMA:
 {{
   "verdict": "faithful|mutated|ambiguous",
@@ -196,7 +216,9 @@ OUTPUT JSON SCHEMA:
   "ambiguous_due_to_missing_context": true,
   "confidence": 0.0,
   "key_mismatches": ["..."],
-  "preserved_points": ["..."]
+  "preserved_points": ["..."],
+  "explanation": "string",
+  "warnings": ["..."]
 }}
 """
         parsed, _ = call_openai_json(system, user)
@@ -209,7 +231,7 @@ OUTPUT JSON SCHEMA:
 class IntegrityValidatorAgent(BaseAgent):
     name = "IntegrityValidator"
 
-    def run(self, factcheck: FactCheckReport) -> IntegrityReport:
+    def run(self, factcheck: FactCheckReport, critic_feedback: Optional[str] = None) -> IntegrityReport:
         system = (
             "You are an integrity validator.\n"
             "Your job: sanity check the FactCheckReport for internal consistency.\n"
@@ -217,15 +239,22 @@ class IntegrityValidatorAgent(BaseAgent):
             "Return ONLY valid JSON."
         )
 
+        feedback = critic_feedback or "(none)"
+
         user = f"""
 FACTCHECK REPORT:
 {factcheck.model_dump_json(indent=2)}
+
+CRITIC FEEDBACK (address explicitly):
+{feedback}
 
 OUTPUT JSON SCHEMA:
 {{
   "passes": true,
   "issues": ["..."],
-  "confidence": 0.0
+  "confidence": 0.0,
+  "explanation": "string",
+  "warnings": ["..."]
 }}
 """
         parsed, _ = call_openai_json(system, user)
@@ -235,6 +264,68 @@ OUTPUT JSON SCHEMA:
             raise RuntimeError(f"Invalid IntegrityReport output: {parsed}") from e
 
 
+class CriticAgent(BaseAgent):
+    name = "Critic"
+
+    def run(
+        self,
+        reference_truth: str,
+        system_claim: str,
+        gap: GapAnalysis,
+        context: BuiltContext,
+        relevancy: RelevancyReport,
+        factcheck: FactCheckReport,
+        integrity: IntegrityReport,
+    ) -> CriticReport:
+        system = (
+            "You are a meta-critic supervising a committee of agents performing semantic faithfulness checking.\n"
+            "Given all agent outputs, identify issues, inconsistencies, or missing analyses.\n"
+            "When you find issues, propose reruns for specific agents with concrete instructions.\n"
+            "Return ONLY valid JSON."
+        )
+
+        user = f"""
+REFERENCE TRUTH:
+{reference_truth}
+
+SYSTEM CLAIM:
+{system_claim}
+
+AGENT OUTPUTS (verbatim JSON):
+- GAP: {gap.model_dump_json()}
+- CONTEXT: {context.model_dump_json()}
+- RELEVANCY: {relevancy.model_dump_json()}
+- FACTCHECK: {factcheck.model_dump_json()}
+- INTEGRITY: {integrity.model_dump_json()}
+
+WHAT TO DO:
+- List concrete issues (if any).
+- For each rerun request, name the target_agent and give a precise instruction; keep the list short and actionable.
+- Keep confidence calibrated.
+- Provide a concise explanation and optional warnings.
+
+OUTPUT JSON SCHEMA:
+{{
+  "issues": ["..."],
+  "requests": [
+    {{
+      "target_agent": "ContextGapDetector|ContextBuilder|RelevancyAssessor|FactChecker|IntegrityValidator",
+      "instruction": "string",
+      "priority": "low|medium|high"
+    }}
+  ],
+  "confidence": 0.0,
+  "explanation": "string",
+  "warnings": ["..."]
+}}
+"""
+        parsed, _ = call_openai_json(system, user)
+        try:
+            return CriticReport(**parsed)
+        except ValidationError as e:
+            raise RuntimeError(f"Invalid CriticReport output: {parsed}") from e
+
+
 __all__ = [
     "BaseAgent",
     "ContextGapDetectorAgent",
@@ -242,4 +333,5 @@ __all__ = [
     "RelevancyAssessorAgent",
     "FactCheckerAgent",
     "IntegrityValidatorAgent",
+    "CriticAgent",
 ]
