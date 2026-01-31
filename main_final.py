@@ -551,7 +551,7 @@ def main():
     TRUTH_COL = "truth"
     CLAIM_COL = "claim"
 
-    rows_to_check = [5, 6]  # only these rows
+    rows_to_check = [5, 8]  # only these rows
     SWAP_FACT_AND_CLAIM = False  # set True if your CSV columns are reversed
 
     rows = df.iloc[[i for i in rows_to_check if i in df.index]]
