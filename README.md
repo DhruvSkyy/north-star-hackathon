@@ -11,6 +11,7 @@ The output is a clear verdict:
 - **MUTATED** – meaning changed  
 - **AMBIGUOUS** – insufficient context or unresolved logical disagreement  
 
+Won second place in FACTTRACE cambridge hackathon. 
 ---
 
 ## How it works (high level)
